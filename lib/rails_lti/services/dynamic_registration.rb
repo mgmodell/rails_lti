@@ -13,6 +13,7 @@ module RailsLti
       # @param registration_token [String, nil] Optional bearer token for the registration request
       # @param tool_url [String] Base URL of the tool
       def initialize(openid_configuration_url:, registration_token: nil, tool_url:)
+        validate_https_url!(openid_configuration_url, "openid_configuration_url")
         @openid_configuration_url = openid_configuration_url
         @registration_token       = registration_token
         @tool_url                 = tool_url
@@ -35,6 +36,8 @@ module RailsLti
       def register!(openid_config)
         registration_endpoint = openid_config["registration_endpoint"]
         raise Error, "No registration_endpoint in OpenID configuration" unless registration_endpoint
+
+        validate_https_url!(registration_endpoint, "registration_endpoint")
 
         body    = build_registration_payload(openid_config)
         headers = { "Content-Type" => REGISTRATION_MEDIA_TYPE }
@@ -114,6 +117,17 @@ module RailsLti
         @conn ||= Faraday.new do |f|
           f.adapter Faraday.default_adapter
         end
+      end
+
+      # Validate that a URL uses HTTPS (or HTTP for localhost in development).
+      # Raises Error if the URL is invalid or uses a disallowed scheme.
+      def validate_https_url!(url, param_name)
+        parsed = URI.parse(url)
+        unless parsed.is_a?(URI::HTTP) && %w[http https].include?(parsed.scheme)
+          raise Error, "#{param_name} must be a valid HTTP/HTTPS URL"
+        end
+      rescue URI::InvalidURIError
+        raise Error, "#{param_name} is not a valid URL"
       end
     end
   end

@@ -1,0 +1,19 @@
+<%# Shown after a successful dynamic registration %>
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>LTI Tool Registered</title>
+    <style>
+      body { font-family: sans-serif; max-width: 600px; margin: 2em auto; }
+      .success { color: green; }
+    </style>
+  </head>
+  <body>
+    <h1 class="success">✔ Tool Registered Successfully</h1>
+    <p>
+      The tool has been registered with <strong><%= @platform.issuer %></strong>
+      (client_id: <code><%= @platform.client_id %></code>).
+    </p>
+    <p>You may close this window.</p>
+  </body>
+</html>

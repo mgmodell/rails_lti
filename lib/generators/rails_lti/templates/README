@@ -1,0 +1,26 @@
+===============================================================================
+
+  RailsLti has been installed! Next steps:
+
+  1. Run the migration:
+       rails db:migrate
+
+  2. Mount the engine in config/routes.rb (already added):
+       mount RailsLti::Engine => "/lti"
+
+  3. Configure the engine in config/initializers/rails_lti.rb.
+     At minimum, set your tool URL and private key:
+
+       RailsLti.configure do |config|
+         config.tool_url   = "https://mytool.example.com"
+         config.private_key = Rails.application.credentials.lti_private_key
+       end
+
+  4. Register your tool with an LTI 1.3 platform:
+     - Manually: create a RailsLti::Platform and RailsLti::Deployment record.
+     - Automatically: direct the platform admin to GET /lti/registration
+       with the openid_configuration URL.
+
+  5. See the README for full usage documentation.
+
+===============================================================================

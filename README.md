@@ -1087,7 +1087,8 @@ class MigrateLtiResourceLinksToRailsLti < ActiveRecord::Migration[8.1]
       next unless old
 
       new_deployment = RailsLti::Deployment.joins(:platform).find_by(
-        rails_lti_platforms: { issuer: old.issuer, client_id: old.client_id }
+        rails_lti_platforms: { issuer: old.issuer, client_id: old.client_id },
+        deployment_id: old.deployment_id.presence || "1"
       )
       link.update_column(:rails_lti_deployment_id, new_deployment&.id)
     end
@@ -1146,10 +1147,12 @@ RailsLti.configure do |config|
     controller.session[:lti_embedded] = true
 
     if message_type == "LtiDeepLinkingRequest"
-      # Store deep-link settings for use in select_content / deep_link_response
+      # Resolve the deployment from the session (set by the engine before calling
+      # after_launch) so deep_link_deployment_id is always a valid record ID.
+      deployment = RailsLti::Deployment.find(controller.session[:lti_deployment_id])
       controller.session[:lti_deep_link_settings] =
         claims["https://purl.imsglobal.org/spec/lti-dl/claim/deep_linking_settings"]
-      controller.session[:lti_deep_link_deployment_id] = controller.session[:lti_deployment_id]
+      controller.session[:lti_deep_link_deployment_id] = deployment.id
       controller.session[:lti_deep_link_context] =
         claims["https://purl.imsglobal.org/spec/lti/claim/context"]
 
@@ -1169,6 +1172,9 @@ RailsLti.configure do |config|
     )
     resource_link.context_id    = context["id"]
     resource_link.context_title = context["title"]
+    # Only set course_id from custom params on the first launch (when not yet set).
+    # Once an instructor has explicitly associated the resource link to a course
+    # via the linking UI, subsequent launches should not override that choice.
     resource_link.course_id   ||= custom["colab_course_id"].presence&.to_i
     resource_link.line_item_url ||= ags_claim&.dig("lineitem")
     resource_link.save!

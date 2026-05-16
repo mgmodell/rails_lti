@@ -38,7 +38,8 @@ A mountable Rails engine that provides full **LTI 1.3 Advantage** support to any
 11. [Endpoints Reference](#endpoints-reference)
 12. [Test Helpers](#test-helpers)
 13. [Maintenance](#maintenance)
-14. [Migrating from Another LTI Library](#migrating-from-another-lti-library)
+14. [Migrating from a Custom LTI 1.3 Implementation (CoLab)](#migrating-from-a-custom-lti-13-implementation-colab)
+15. [Migrating from Another LTI Library](#migrating-from-another-lti-library)
 
 ---
 
@@ -908,6 +909,449 @@ class LtiNonceCleanupJob < ApplicationJob
   end
 end
 ```
+
+---
+
+## Migrating from a Custom LTI 1.3 Implementation (CoLab)
+
+This section gives concrete guidance for adopting `rails_lti` in an application that already implements LTI 1.3 with its own controller and models — using CoLab as the reference implementation.
+
+### What the engine replaces vs. what you keep
+
+| CoLab component | Action |
+|---|---|
+| `LtiController#register` | **Delete** — engine handles `GET/POST /lti/registration` |
+| `LtiController#login` | **Delete** — engine handles `GET/POST /lti/login` |
+| `LtiController#launch` | **Delete** — engine handles `POST /lti/launch` |
+| `LtiNonce` model + migration | **Delete** — replaced by `RailsLti::Nonce` |
+| `LtiDeployment` model + migration | **Replace** with `RailsLti::Platform` + `RailsLti::Deployment` (see below) |
+| `LtiDeployment#fetch_key_set` | **Delete** — engine fetches platform JWKS internally |
+| `LtiDeployment#request_access_token` | **Delete** — engine issues tokens via `AccessTokenService` |
+| `LtiController#select_content` | **Keep** — CoLab-specific content-selection UI |
+| `LtiController#deep_link_response` | **Keep** — use `RailsLti::Services::DeepLink` to build the JWT |
+| `LtiController#link_resource` / `#associate_resource_link` | **Keep** — CoLab-specific resource-link management |
+| `LtiController#names_roles` | **Keep, simplify** — replace manual HTTP with `RailsLti::Services::Nrps` |
+| `LtiController#grades` | **Keep, simplify** — replace manual HTTP with `RailsLti::Services::Ags` |
+| `LtiController#simulate_launch` | **Keep** — test-only endpoint; update session keys (see below) |
+| `LtiResourceLink` model | **Keep** — CoLab-specific; update FK from `lti_deployment_id` to `rails_lti_deployment_id` |
+| `LtiGradable` concern | **Keep** — no change required |
+| `keypairs` gem / `/.well-known/jwks.json` | **Decision point** — see Key Management below |
+
+---
+
+### Step 1 — Add the gem and run the installer
+
+```ruby
+# Gemfile
+gem "rails_lti"
+```
+
+```sh
+bundle install
+rails generate rails_lti:install
+rails db:migrate
+```
+
+The installer creates three tables (`rails_lti_platforms`, `rails_lti_deployments`,
+`rails_lti_nonces`) and mounts the engine at `/lti` in `config/routes.rb`.
+
+---
+
+### Step 2 — Key management
+
+CoLab currently uses the **`keypairs` gem** to manage the RSA signing key and exposes
+the public JWK Set at `/.well-known/jwks.json` via `Keypairs::PublicKeysController`.
+All platforms registered against CoLab already point their JWKS-verification URL to
+that path.
+
+**Option A — Keep `keypairs` (least disruption, recommended for existing deployments)**
+
+Bridge the two key systems so `rails_lti` signs with the same key that `keypairs`
+already published:
+
+```ruby
+# config/initializers/rails_lti.rb
+RailsLti.configure do |config|
+  config.tool_url = "https://colab.example.com"
+
+  # Re-use the current keypairs private key so the existing JWKS at
+  # /.well-known/jwks.json remains the authoritative key set.
+  config.private_key = Keypair.current.private_key
+
+  # Keep /.well-known/jwks.json as the JWKS URL in platform configs.
+  # The engine's /lti/jwks endpoint can be left unused or disabled.
+
+  config.after_launch = ->(controller, claims) { ... }  # see Step 5
+end
+```
+
+Keep the existing route for the JWKS endpoint:
+
+```ruby
+# config/routes.rb (keep this line — do not replace with /lti/jwks)
+scope '.well-known' do
+  get :jwks, to: Keypairs::PublicKeysController.action(:index), as: :lti_jwks
+end
+```
+
+**Option B — Switch to rails_lti's key**
+
+Generate a new RSA key, store it in credentials, and update the JWKS URL in every
+registered platform to `https://colab.example.com/lti/jwks`. This is the cleaner
+long-term approach but requires a coordinated cutover with each LMS admin.
+
+```ruby
+config.private_key = Rails.application.credentials.lti_private_key
+# Remove the keypairs gem after all platform registrations are updated.
+```
+
+---
+
+### Step 3 — Update `config/routes.rb`
+
+Remove the manual LTI routes that the engine now owns, and keep only the CoLab-specific
+ones:
+
+```ruby
+# config/routes.rb
+
+# Mount the engine (the generator adds this automatically)
+mount RailsLti::Engine => "/lti"
+
+# Keep /.well-known/jwks.json only if using Option A above
+scope '.well-known' do
+  get :jwks, to: Keypairs::PublicKeysController.action(:index), as: :lti_jwks
+end
+
+# REMOVE these — the engine owns them now:
+#   get/post 'lti/tool_connect'
+#   get/post 'lti/lti_connect'
+#   get/post 'lti/login'
+#   post     'lti/launch'
+
+# KEEP these — CoLab-specific routes:
+get  'lti/select_content'      => 'lti#select_content',      as: :lti_select_content
+post 'lti/deep_link_response'  => 'lti#deep_link_response',  as: :lti_deep_link_response
+get  'lti/link_resource'       => 'lti#link_resource',       as: :lti_link_resource
+post 'lti/link_resource'       => 'lti#associate_resource_link', as: :lti_associate_resource_link
+post 'lti/names_roles/:id'     => 'lti#names_roles',         as: :lti_names_roles
+post 'lti/grades/:id'          => 'lti#grades',              as: :lti_grades
+post 'lti/simulate_launch'     => 'lti#simulate_launch',     as: :lti_simulate_launch if Rails.env.test?
+```
+
+> **Registration URL change:** The engine's dynamic registration endpoint is
+> `/lti/registration`, not `/lti/tool_connect`. Any platform that was registered via
+> dynamic registration will not be affected (the record is already persisted), but
+> future registrations must use the new URL. Update CoLab's documentation and any
+> LMS-side configuration guides accordingly.
+
+---
+
+### Step 4 — Migrate `LtiDeployment` records to `RailsLti::Platform` + `RailsLti::Deployment`
+
+CoLab's `LtiDeployment` combines what `rails_lti` splits into a `Platform` (one per
+issuer+client_id) and a `Deployment` (one per deployment_id within a platform).
+
+Run this one-time migration in a Rails console or a data migration:
+
+```ruby
+LtiDeployment.find_each do |old|
+  platform = RailsLti::Platform.find_or_create_by!(
+    issuer:    old.issuer,
+    client_id: old.client_id
+  ) do |p|
+    p.oidc_auth_url = old.auth_login_url
+    p.jwks_url      = old.key_set_url
+    p.token_url     = old.auth_token_url
+  end
+
+  RailsLti::Deployment.find_or_create_by!(
+    platform:      platform,
+    client_id:     old.client_id,
+    deployment_id: old.deployment_id.presence || "1"
+  )
+end
+```
+
+Then update `LtiResourceLink` to reference `RailsLti::Deployment` instead of the old
+`LtiDeployment`. Add a migration:
+
+```ruby
+# db/migrate/TIMESTAMP_migrate_lti_resource_links_to_rails_lti.rb
+class MigrateLtiResourceLinksToRailsLti < ActiveRecord::Migration[8.1]
+  def up
+    add_column :lti_resource_links, :rails_lti_deployment_id, :bigint
+
+    LtiResourceLink.find_each do |link|
+      old = LtiDeployment.find_by(id: link.lti_deployment_id)
+      next unless old
+
+      new_deployment = RailsLti::Deployment.joins(:platform).find_by(
+        rails_lti_platforms: { issuer: old.issuer, client_id: old.client_id }
+      )
+      link.update_column(:rails_lti_deployment_id, new_deployment&.id)
+    end
+
+    add_foreign_key :lti_resource_links, :rails_lti_deployments,
+                    column: :rails_lti_deployment_id
+    # Once verified, drop the old column:
+    # remove_column :lti_resource_links, :lti_deployment_id
+  end
+end
+```
+
+Update `LtiResourceLink` model:
+
+```ruby
+class LtiResourceLink < ApplicationRecord
+  belongs_to :rails_lti_deployment, class_name: "RailsLti::Deployment",
+             foreign_key: :rails_lti_deployment_id
+  alias_attribute :lti_deployment, :rails_lti_deployment
+
+  belongs_to :course,     optional: true
+  belongs_to :assignment, optional: true
+  # ...
+end
+```
+
+---
+
+### Step 5 — Implement `after_launch`
+
+The engine calls `after_launch` immediately before redirecting to `target_link_uri`.
+This is where all the logic currently in `LtiController#handle_resource_link_request`
+and `#handle_deep_linking_request` should live.
+
+```ruby
+# config/initializers/rails_lti.rb
+RailsLti.configure do |config|
+  config.tool_url   = "https://colab.example.com"
+  config.private_key = Keypair.current.private_key  # Option A
+
+  config.after_launch = ->(controller, claims) {
+    message_type = claims["https://purl.imsglobal.org/spec/lti/claim/message_type"]
+
+    # 1. Find or provision the CoLab user from the JWT claims
+    email = claims["email"]
+    user = User.joins(:emails).find_by(emails: { email: }) ||
+           User.create!(
+             email:      email,
+             first_name: claims["given_name"] || "LTI",
+             last_name:  claims["family_name"] || "User",
+             password:   SecureRandom.hex(24),
+             timezone:   "UTC"
+           ).tap(&:confirm)
+
+    controller.sign_in(user)
+    controller.session[:lti_embedded] = true
+
+    if message_type == "LtiDeepLinkingRequest"
+      # Store deep-link settings for use in select_content / deep_link_response
+      controller.session[:lti_deep_link_settings] =
+        claims["https://purl.imsglobal.org/spec/lti-dl/claim/deep_linking_settings"]
+      controller.session[:lti_deep_link_deployment_id] = controller.session[:lti_deployment_id]
+      controller.session[:lti_deep_link_context] =
+        claims["https://purl.imsglobal.org/spec/lti/claim/context"]
+
+      return Rails.application.routes.url_helpers.lti_select_content_path
+    end
+
+    # Resource-link launch: find/create the resource link
+    deployment = RailsLti::Deployment.find(controller.session[:lti_deployment_id])
+    rl_claim   = claims["https://purl.imsglobal.org/spec/lti/claim/resource_link"] || {}
+    context    = claims["https://purl.imsglobal.org/spec/lti/claim/context"] || {}
+    custom     = claims["https://purl.imsglobal.org/spec/lti/claim/custom"] || {}
+    ags_claim  = claims["https://purl.imsglobal.org/spec/lti-ags/claim/endpoint"]
+
+    resource_link = LtiResourceLink.find_or_initialize_by(
+      rails_lti_deployment_id: deployment.id,
+      resource_link_id: rl_claim["id"]
+    )
+    resource_link.context_id    = context["id"]
+    resource_link.context_title = context["title"]
+    resource_link.course_id   ||= custom["colab_course_id"].presence&.to_i
+    resource_link.line_item_url ||= ags_claim&.dig("lineitem")
+    resource_link.save!
+
+    # Enroll the user in the linked course
+    if resource_link.course
+      roles         = claims["https://purl.imsglobal.org/spec/lti/claim/roles"] || []
+      is_instructor = roles.any? { |r| r.include?("Instructor") }
+      roster = Roster.find_or_initialize_by(user: user, course: resource_link.course)
+      roster.role = is_instructor ? Roster.roles[:instructor] : Roster.roles[:enrolled_student]
+      roster.save
+    end
+
+    # If resource link is not yet associated and the user is an instructor,
+    # send them to the linking screen
+    if resource_link.assignment.nil? && resource_link.course.nil?
+      roles = claims["https://purl.imsglobal.org/spec/lti/claim/roles"] || []
+      if roles.any? { |r| r.include?("Instructor") }
+        controller.session[:lti_pending_resource_link_id] = resource_link.id
+        controller.session[:lti_pending_lineitems_url] = ags_claim&.dig("lineitems")
+        return Rails.application.routes.url_helpers.lti_link_resource_path
+      end
+    end
+
+    nil  # fall through to target_link_uri
+  }
+end
+```
+
+---
+
+### Step 6 — Simplify `LtiController#deep_link_response`
+
+Replace the hand-rolled `build_deep_link_response_jwt` private method with
+`RailsLti::Services::DeepLink`:
+
+```ruby
+# app/controllers/lti_controller.rb
+def deep_link_response
+  # ... existing session/guard checks ...
+
+  deployment = RailsLti::Deployment.find(session[:lti_deep_link_deployment_id])
+  dl_settings = session[:lti_deep_link_settings]
+
+  content_items = build_content_items(params[:activity_type], params[:activity_id])
+
+  service = RailsLti::Services::DeepLink.new(deployment, dl_settings, content_items)
+  @jwt        = service.build_response_jwt
+  @return_url = service.return_url
+
+  session.delete(:lti_deep_link_settings)
+  session.delete(:lti_deep_link_deployment_id)
+  session.delete(:lti_deep_link_context)
+
+  render :deep_link_response
+end
+```
+
+Delete the `build_deep_link_response_jwt` and `build_tool_config` private methods —
+they are now handled by the engine.
+
+---
+
+### Step 7 — Simplify `LtiController#names_roles`
+
+Replace the manual `Net::HTTP` NRPS call with `RailsLti::Services::Nrps`:
+
+```ruby
+def names_roles
+  resource_link = LtiResourceLink.find_by(id: params[:id])
+
+  unless resource_link&.course
+    render json: { error: "Resource link not found or not associated with a course" },
+           status: :not_found
+    return
+  end
+
+  deployment    = resource_link.lti_deployment  # aliased to rails_lti_deployment
+  nrps_claims   = { "context_memberships_url" => resource_link.names_roles_url }
+  nrps          = RailsLti::Services::Nrps.new(deployment, nrps_claims)
+  members       = nrps.members
+  synced        = sync_roster(resource_link.course, members)
+
+  render json: { synced_count: synced, members_received: members.size }
+rescue RailsLti::Services::Nrps::Error => e
+  render json: { error: e.message }, status: :internal_server_error
+end
+```
+
+---
+
+### Step 8 — Simplify `LtiController#grades`
+
+Replace the manual `Net::HTTP` AGS call with `RailsLti::Services::Ags`:
+
+```ruby
+def grades
+  resource_link = LtiResourceLink.find_by(id: params[:id])
+
+  unless resource_link&.assignment
+    render json: { error: "Resource link not associated with an assignment" },
+           status: :not_found
+    return
+  end
+
+  deployment = resource_link.lti_deployment
+  ags_claims = {
+    "lineitem" => resource_link.line_item_url,
+    "scope"    => [RailsLti::Services::Ags::AGS_LINEITEM_SCOPE,
+                   RailsLti::Services::Ags::AGS_SCORE_SCOPE]
+  }
+  ags = RailsLti::Services::Ags.new(deployment, ags_claims)
+
+  pushed = 0
+  resource_link.assignment.submissions.where.not(recorded_score: nil).each do |sub|
+    ags.submit_score(
+      user_id:           sub.user.id.to_s,
+      score:             sub.recorded_score,
+      score_maximum:     100.0,
+      activity_progress: RailsLti::Services::Ags::ACTIVITY_PROGRESS_COMPLETED,
+      grading_progress:  RailsLti::Services::Ags::GRADING_PROGRESS_FULLY_GRADED
+    )
+    pushed += 1
+  rescue RailsLti::Services::Ags::Error => e
+    logger.warn "AGS score push failed for submission #{sub.id}: #{e.message}"
+  end
+
+  render json: { pushed_count: pushed }
+end
+```
+
+---
+
+### Step 9 — Update `simulate_launch` session keys
+
+The `simulate_launch` test endpoint sets session keys directly. Update it to use the
+same keys that the engine writes so the rest of the test flow is consistent:
+
+```ruby
+# The engine writes these keys after a successful launch:
+controller.session[:lti_authenticated]   = true
+controller.session[:lti_launch_claims]   = payload   # full JWT claims hash
+controller.session[:lti_deployment_id]   = deployment.id  # RailsLti::Deployment#id
+
+# CoLab-specific keys (set in after_launch callback):
+controller.session[:lti_embedded]        = true
+controller.session[:lti_deep_link_settings]      = ... # deep linking only
+controller.session[:lti_deep_link_deployment_id] = ... # deep linking only
+controller.session[:lti_pending_resource_link_id] = ... # resource-link association
+```
+
+---
+
+### Step 10 — Remove deleted code
+
+Once all the above steps are complete and tests pass, remove:
+
+- `app/models/lti_nonce.rb` and its migration
+- `app/models/lti_deployment.rb` and its migration (keep `LtiResourceLink`)
+- `LtiController#register`, `#login`, `#launch`
+- Private methods: `build_tool_config`, `build_deep_link_response_jwt`, `verify_jwt`,
+  `find_deployment`, `tool_base_url`, `registration_error_message`, `allow_iframe`,
+  `lti_layout` (unless still needed for other actions)
+- The `lti_nonces` table (after confirming `rails_lti_nonces` is in use)
+
+---
+
+### Important caveat: cross-site session state
+
+CoLab stores the OIDC `state`/`nonce` pair in the **database** (`LtiNonce`) rather
+than in the browser session, because both `/lti/login` and `/lti/launch` are
+cross-site POST requests and `SameSite=Lax` cookies are not reliably sent for those
+requests in all browsers and LMS configurations.
+
+`rails_lti` currently stores `state` and `nonce` in the **session cookie**. This
+works in most configurations, but if you observe `State mismatch` errors during
+the OIDC handshake — especially with Moodle embedded in an iframe — the likely cause
+is the same cross-site cookie issue that CoLab's `LtiNonce` was built to avoid.
+
+Mitigation options until the engine adds database-backed state:
+- Configure your session store to use `SameSite=None; Secure` (requires HTTPS)
+- Use a shared Redis session store so state survives the cross-site hop
+- Run CoLab at the same origin as the LMS (not usually feasible)
 
 ---
 
